@@ -1,0 +1,31 @@
+---
+name: helm
+
+on:
+  workflow_call:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v1
+
+      - name: install unittest
+        run: |
+          helm plugin install https://github.com/quintush/helm-unittest
+
+      # This is not optimized, only run in dir changed
+      - name: Run tests
+        run: |
+          for file in $(find -type d -name "tests"); do
+            chart=$(dirname $file)
+            pushd $chart
+            helm dep update
+            popd
+            echo "Run unittest on $chart"
+            helm unittest $chart --helm3
+          done

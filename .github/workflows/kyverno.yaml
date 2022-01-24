@@ -1,0 +1,155 @@
+---
+name: kyverno
+
+on:
+  workflow_call:
+
+jobs:
+  matrix-build:
+    runs-on: ubuntu-latest
+    name: Matrix construction
+    outputs:
+      modified_files: ${{ steps.changed-files-specific.outputs.modified_files }}
+      helm-matrix: ${{ steps.generate-matrix.outputs.helm-matrix }}
+      kustomize-matrix: ${{ steps.generate-matrix.outputs.kustomize-matrix }}
+
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Get specific changed files
+        id: changed-files-specific
+        uses: tj-actions/changed-files@v13
+        with:
+          files: |
+            **/*.yaml
+            **/*.yml
+
+      - name: Run step if any of the listed files above change
+        id: generate-matrix
+        run: |
+          for file in ${{ steps.changed-files-specific.outputs.modified_files }}; do
+            # get root directory
+            ROOT_DIR=`dirname $file | cut -d "/" -f1`
+            if [ -f "$ROOT_DIR/Chart.yaml" ]
+            then
+              echo "$ROOT_DIR -> HELM"
+              # add quotes to each root dir
+              MATRIX_HELM_JSON+=$(sed 's/^/"/;s/$/" /' <<< $ROOT_DIR)
+              # we have: "velero" "traefik" in one line
+              # convert to bash array
+              MATRIX_HELM_JSON=($MATRIX_HELM_JSON)
+              # split with comma and add [
+              MATRIX_HELM_JSON=$(IFS=,;printf  "[%s]" "${MATRIX_HELM_JSON[*]}")
+              echo "Helm matrix -> $MATRIX_HELM_JSON"
+              # we have ["velero","traefik"]
+              echo "::set-output name=helm-matrix::${MATRIX_HELM_JSON}"
+            elif [ -f "$ROOT_DIR/kustomization.yaml" ]
+            then
+              echo "$ROOT_DIR -> KUSTOMIZE"
+              MATRIX_KUSTOMIZE_JSON+=$(sed 's/^/"/;s/$/" /' <<< $ROOT_DIR)
+              MATRIX_KUSTOMIZE_JSON=($MATRIX_KUSTOMIZE_JSON)
+              MATRIX_KUSTOMIZE_JSON=$(IFS=,;printf  "[%s]" "${MATRIX_KUSTOMIZE_JSON[*]}")
+              echo "Kustomize matrix -> $MATRIX_KUSTOMIZE_JSON"
+              echo "::set-output name=kustomize-matrix::${MATRIX_KUSTOMIZE_JSON}"
+            fi
+          done
+
+  kyverno-helm:
+    needs:
+      - matrix-build
+    runs-on: ubuntu-latest
+    name: Launch HELM kyverno
+    strategy:
+      fail-fast: false
+      matrix:
+        file_changed: ${{ fromJson(needs.matrix-build.outputs.helm-matrix) }}
+
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - uses: azure/setup-helm@v1
+        id: install
+
+      - name: Helm template
+        id: helm-template
+        run: |
+          helm dependency update ${{ matrix.file_changed }}
+          helm template ${{ matrix.file_changed }} --values ${{ matrix.file_changed }}/values.yaml >> ${{ matrix.file_changed }}.yaml
+
+      - name: Validate policy
+        id: kyverno-validate-policy
+        uses: gbaeke/kyverno-cli@v1
+        with:
+          command: |
+            # https://trstringer.com/github-actions-multiline-strings/
+            # + Don't know how to retrieve output vars dynamically via matrix jobs...
+            kyverno apply ./kyverno-policies/generic --resource=${{ matrix.file_changed }}.yaml >> ${{ matrix.file_changed }}-report.md
+
+      - name: Format comment
+        if: always()
+        id: kyverno-format-comment
+        run: |
+          sed -i '1 i\<details>' ${{ matrix.file_changed }}-report.md
+          echo '</details>' >> ${{ matrix.file_changed }}-report.md
+          sed -i '1 i\# Kyverno Helm ${{ matrix.file_changed }} report' ${{ matrix.file_changed }}-report.md
+
+      - name: Comment PR
+        if: always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: ${{ matrix.file_changed }}-helm-report
+          delete: true
+          path: ./${{ matrix.file_changed }}-report.md
+
+
+  kyverno-kustomize:
+    needs:
+      - matrix-build
+    runs-on: ubuntu-latest
+    name: Launch Kustomize kyverno
+    strategy:
+      fail-fast: false
+      matrix:
+        file_changed: ${{ fromJson(needs.matrix-build.outputs.kustomize-matrix) }}
+
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - uses: imranismail/setup-kustomize@v1
+        id: install
+
+      - name: Kustomize build
+        id: kustomize-build
+        run: |
+          kustomize build ${{ matrix.file_changed }} >> ${{ matrix.file_changed }}.yaml
+
+      - name: Validate policy
+        id: kyverno-validate-policy
+        uses: gbaeke/kyverno-cli@v1
+        with:
+          command: |
+            # https://trstringer.com/github-actions-multiline-strings/
+            # + Don't know how to retrieve output vars dynamically via matrix jobs...
+            kyverno apply ./kyverno-policies/generic --resource=${{ matrix.file_changed }}.yaml >> ${{ matrix.file_changed }}-report.md
+
+      - name: Format comment
+        if: always()
+        id: kyverno-format-comment
+        run: |
+          sed -i '1 i\<details>' ${{ matrix.file_changed }}-report.md
+          echo '</details>' >> ${{ matrix.file_changed }}-report.md
+          sed -i '1 i\# Kyverno Kustomize ${{ matrix.file_changed }} report' ${{ matrix.file_changed }}-report.md
+
+      - name: Comment PR
+        if: always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: ${{ matrix.file_changed }}-kustomize-report
+          delete: true
+          path: ./${{ matrix.file_changed }}-report.md
